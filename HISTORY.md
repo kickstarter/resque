@@ -1,9 +1,43 @@
-## Unreleased
+## 1.25.2 (TBD)
+
+* Respect TERM_CHILD setting when not forking (@ggilder)
+* implementation of backend connection with a hash (Andrea Rossi)
+* require yaml for show_args support (@yaauie)
+* use redis-namespace 1.3 (Andrea Rossi)
+* fix DOCS link in README (@cade)
+* Fix worker prune test to actually run its assertion & cover reality. (@yaauie)
+* Eliminate infinite recursion when Resque::Helpers mixed into Resque (@yaml)
+* use ruby, avoid shelling out. google++ (@hone)
+* Failed Assertions Don't Fail Tests :rage: (@yaauie)
+
+## 1.25.1 (2013-9-26)
+
+* Actually require Forwardable from the standard library.
+
+## 1.25.0 (TBD)
 * Updates fork method so [resque-multi-job-forks](https://github.com/stulentsev/resque-multi-job-forks)
   monkey patching works again. See discussion at https://github.com/defunkt/resque/pull/895 for more
   context (@jonhyman)
-* Fixed uninitialize constant for the module/class that contains the perform 
+* Use Redis.pipelined to group batches of redis commands.
+  https://github.com/resque/resque/pull/902 (@jonhyman)
+* Fixed uninitialize constant for the module/class that contains the perform
   method causing job failures to no be reported, #792 (@sideshowcoder)
+* Fix Resque::Failure::Base.all to have the correct signature.
+  (@rentalutions)
+* Don't close stdio pipes when daemonizing so as to not hide errors. #967
+  (@sideshowcoder)
+* Fix for worker_pids on Windows. #980 (@kzgs)
+* Only prune workers for queues the current worker knows about. #1000
+  (!) (@dsabanin)
+* Handle duplicate TERM signals. #988 (@softwaregravy)
+* Fix issue with exiting workers and unintentionally deregistering the
+  parent when the forked child exits. #1017 (@magec)
+* Fix encoding errors with local date formatting. #1065 (@katafrakt)
+* Fix CI for 1.8.7 and 1.9.2 modes due to dependencies. #1090
+  (@adelcambre)
+* Allow using globs for queue names to listen on, allowing things like
+  listening on `staging_*`. #1085 (@adelcambre)
+
 
 ## 1.24.1 (2013-3-23)
 

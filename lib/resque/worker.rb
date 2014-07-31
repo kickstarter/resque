@@ -19,7 +19,7 @@ module Resque
     def self.redis
       Resque.redis
     end
-    
+
     # Given a Ruby object, returns a string suitable for storage in a
     # queue.
     def encode(object)
@@ -187,14 +187,20 @@ module Resque
             job.fail(DirtyExit.new($?.to_s)) if $?.signaled?
           else
             unregister_signal_handlers if will_fork? && term_child
+            begin
 
-            reconnect
-            perform(job, &block)
+              reconnect
+              perform(job, &block)
+
+            rescue Exception => exception
+              report_failed_job(job,exception)
+            end
 
             if will_fork?
               run_at_exit_hooks ? exit : exit!
             end
           end
+
           done_working
           @child = nil
         else
@@ -207,9 +213,11 @@ module Resque
 
       unregister_worker
     rescue Exception => exception
-      log "Failed to start worker : #{exception.inspect}"
+      unless exception.class == SystemExit && !@child && run_at_exit_hooks
+        log "Failed to start worker : #{exception.inspect}"
 
-      unregister_worker(exception)
+        unregister_worker(exception)
+      end
     end
 
     # DEPRECATED. Processes a single job. If none is given, it will
@@ -224,19 +232,28 @@ module Resque
       done_working
     end
 
+    # Reports the exception and marks the job as failed
+    def report_failed_job(job,exception)
+      log "#{job.inspect} failed: #{exception.inspect}"
+      begin
+        job.fail(exception)
+      rescue Object => exception
+        log "Received exception when reporting failure: #{exception.inspect}"
+      end
+      begin
+        failed!
+      rescue Object => exception
+        log "Received exception when increasing failed jobs counter (redis issue) : #{exception.inspect}"
+      end
+    end
+
     # Processes a given job in the child.
     def perform(job)
       begin
         run_hook :after_fork, job if will_fork?
         job.perform
       rescue Object => e
-        log "#{job.inspect} failed: #{e.inspect}"
-        begin
-          job.fail(e)
-        rescue Object => e
-          log "Received exception when reporting failure: #{e.inspect}"
-        end
-        failed!
+        report_failed_job(job,e)
       else
         log "done: #{job.inspect}"
       ensure
@@ -284,7 +301,20 @@ module Resque
     # A splat ("*") means you want every queue (in alpha order) - this
     # can be useful for dynamically adding new queues.
     def queues
-      @queues.map {|queue| queue == "*" ? Resque.queues.sort : queue }.flatten.uniq
+      @queues.map do |queue|
+        queue.strip!
+        if (matched_queues = glob_match(queue)).empty?
+          queue
+        else
+          matched_queues
+        end
+      end.flatten.uniq
+    end
+
+    def glob_match(pattern)
+      Resque.queues.select do |queue|
+        File.fnmatch?(pattern, queue)
+      end.sort
     end
 
     # Not every platform supports fork. Here we do our magic to
@@ -384,10 +414,19 @@ module Resque
     end
 
     # Kill the child and shutdown immediately.
+    # If not forking, abort this process.
     def shutdown!
       shutdown
       if term_child
-        new_kill_child
+        if fork_per_job?
+          new_kill_child
+        else
+          # Raise TermException in the same process
+          trap('TERM') do
+            # ignore subsequent terms
+          end
+          raise TermException.new("SIGTERM")
+        end
       else
         kill_child
       end
@@ -594,7 +633,11 @@ module Resque
     end
 
     def will_fork?
-      !@cant_fork && !$TESTING && (ENV["FORK_PER_JOB"] != 'false')
+      !@cant_fork && !$TESTING && fork_per_job?
+    end
+
+    def fork_per_job?
+      ENV["FORK_PER_JOB"] != 'false'
     end
 
     # Returns a symbol representing the current worker state,
@@ -621,7 +664,7 @@ module Resque
 
     # chomp'd hostname of this machine
     def hostname
-      @hostname ||= `hostname`.chomp
+      Socket.gethostname
     end
 
     # Returns Integer PID of running worker

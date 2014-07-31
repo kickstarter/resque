@@ -72,6 +72,38 @@ context "Resque::Worker" do
 
   end
 
+  class ::RaiseExceptionOnFailure
+
+    def self.on_failure_trhow_exception(exception,*args)
+      $TESTING = true
+      raise "The worker threw an exception"
+    end
+
+    def self.perform
+      ""
+    end
+  end
+
+  test "should not treat SystemExit as an exception in the child with run_at_exit_hooks == true" do
+
+    if worker_pid = Kernel.fork
+      Process.waitpid(worker_pid)
+    else
+      # ensure we actually fork
+      $TESTING = false
+      Resque.redis.client.reconnect
+      Resque::Job.create(:not_failing_job, RaiseExceptionOnFailure)
+      worker = Resque::Worker.new(:not_failing_job)
+      worker.run_at_exit_hooks = true
+      suppress_warnings do
+        worker.work(0)
+      end
+      exit
+    end
+
+  end
+
+
   test "does not execute at_exit hooks by default" do
     tmpfile = File.join(Dir.tmpdir, "resque_at_exit_test_file")
     FileUtils.rm_f tmpfile
@@ -266,6 +298,19 @@ context "Resque::Worker" do
     assert_equal %w( jobs high critical blahblah ).sort, processed_queues
   end
 
+  test "works with globs" do
+    Resque::Job.create(:critical, GoodJob)
+    Resque::Job.create(:test_one, GoodJob)
+    Resque::Job.create(:test_two, GoodJob)
+
+    worker = Resque::Worker.new("test_*")
+
+    worker.work(0)
+    assert_equal 1, Resque.size(:critical)
+    assert_equal 0, Resque.size(:test_one)
+    assert_equal 0, Resque.size(:test_two)
+  end
+
   test "has a unique id" do
     assert_equal "#{`hostname`.chomp}:#{$$}:jobs", @worker.to_s
   end
@@ -286,13 +331,13 @@ context "Resque::Worker" do
   end
 
   test "inserts itself into the 'workers' list on startup" do
-    @worker.work(0) do
+    @worker.extend(AssertInWorkBlock).work(0) do
       assert_equal @worker, Resque.workers[0]
     end
   end
 
   test "removes itself from the 'workers' list on shutdown" do
-    @worker.work(0) do
+    @worker.extend(AssertInWorkBlock).work(0) do
       assert_equal @worker, Resque.workers[0]
     end
 
@@ -300,7 +345,7 @@ context "Resque::Worker" do
   end
 
   test "removes worker with stringified id" do
-    @worker.work(0) do
+    @worker.extend(AssertInWorkBlock).work(0) do
       worker_id = Resque.workers[0].to_s
       Resque.remove_worker(worker_id)
       assert_equal [], Resque.workers
@@ -308,7 +353,7 @@ context "Resque::Worker" do
   end
 
   test "records what it is working on" do
-    @worker.work(0) do
+    @worker.extend(AssertInWorkBlock).work(0) do
       task = @worker.job
       assert_equal({"args"=>[20, "/tmp"], "class"=>"SomeJob"}, task['payload'])
       assert task['run_at']
@@ -322,7 +367,7 @@ context "Resque::Worker" do
   end
 
   test "knows when it is working" do
-    @worker.work(0) do
+    @worker.extend(AssertInWorkBlock).work(0) do
       assert @worker.working?
     end
   end
@@ -333,7 +378,7 @@ context "Resque::Worker" do
   end
 
   test "knows who is working" do
-    @worker.work(0) do
+    @worker.extend(AssertInWorkBlock).work(0) do
       assert_equal [@worker], Resque.working
     end
   end
@@ -368,27 +413,27 @@ context "Resque::Worker" do
 
   test "knows when it started" do
     time = Time.now
-    @worker.work(0) do
+    @worker.extend(AssertInWorkBlock).work(0) do
       assert Time.parse(@worker.started) - time < 0.1
     end
   end
 
   test "knows whether it exists or not" do
-    @worker.work(0) do
+    @worker.extend(AssertInWorkBlock).work(0) do
       assert Resque::Worker.exists?(@worker)
       assert !Resque::Worker.exists?('blah-blah')
     end
   end
 
   test "sets $0 while working" do
-    @worker.work(0) do
+    @worker.extend(AssertInWorkBlock).work(0) do
       ver = Resque::Version
-      assert_equal "resque-#{ver}: Processing jobs since #{Time.now.to_i}", $0
+      assert_equal "resque-#{ver}: Processing jobs since #{Time.now.to_i} [SomeJob]", $0
     end
   end
 
   test "can be found" do
-    @worker.work(0) do
+    @worker.extend(AssertInWorkBlock).work(0) do
       found = Resque::Worker.find(@worker.to_s)
       assert_equal @worker.to_s, found.to_s
       assert found.working?
@@ -397,28 +442,50 @@ context "Resque::Worker" do
   end
 
   test "doesn't find fakes" do
-    @worker.work(0) do
+    @worker.extend(AssertInWorkBlock).work(0) do
       found = Resque::Worker.find('blah-blah')
       assert_equal nil, found
     end
   end
 
   test "cleans up dead worker info on start (crash recovery)" do
-    # first we fake out two dead workers
+    # first we fake out several dead workers
+    # 1: matches queue and hostname; gets pruned.
     workerA = Resque::Worker.new(:jobs)
     workerA.instance_variable_set(:@to_s, "#{`hostname`.chomp}:1:jobs")
     workerA.register_worker
 
-    workerB = Resque::Worker.new(:high, :low)
-    workerB.instance_variable_set(:@to_s, "#{`hostname`.chomp}:2:high,low")
+    # 2. matches queue but not hostname; no prune.
+    workerB = Resque::Worker.new(:jobs)
+    workerB.instance_variable_set(:@to_s, "#{`hostname`.chomp}-foo:2:jobs")
     workerB.register_worker
 
-    assert_equal 2, Resque.workers.size
+    # 3. matches hostname but not queue; no prune.
+    workerB = Resque::Worker.new(:high)
+    workerB.instance_variable_set(:@to_s, "#{`hostname`.chomp}:3:high")
+    workerB.register_worker
+
+    # 4. matches neither hostname nor queue; no prune.
+    workerB = Resque::Worker.new(:high)
+    workerB.instance_variable_set(:@to_s, "#{`hostname`.chomp}-foo:4:high")
+    workerB.register_worker
+
+    assert_equal 4, Resque.workers.size
 
     # then we prune them
-    @worker.work(0) do
-      assert_equal 1, Resque.workers.size
-    end
+    @worker.work(0)
+
+    worker_strings = Resque::Worker.all.map(&:to_s)
+
+    assert_equal 3, Resque.workers.size
+
+    # pruned
+    assert !worker_strings.include?("#{`hostname`.chomp}:1:jobs")
+
+    # not pruned
+    assert worker_strings.include?("#{`hostname`.chomp}-foo:2:jobs")
+    assert worker_strings.include?("#{`hostname`.chomp}:3:high")
+    assert worker_strings.include?("#{`hostname`.chomp}-foo:4:high")
   end
 
   test "worker_pids returns pids" do
@@ -624,7 +691,7 @@ context "Resque::Worker" do
     assert_not_equal original_connection, Resque.redis.client.connection.instance_variable_get("@sock")
   end
 
-  test "tries to reconnect three times before giving up" do
+  test "tries to reconnect three times before giving up and the failure does not unregister the parent" do
     begin
       class Redis::Client
         alias_method :original_reconnect, :reconnect
@@ -649,6 +716,9 @@ context "Resque::Worker" do
 
       assert_equal 3, stdout.scan(/retrying/).count
       assert_equal 1, stdout.scan(/quitting/).count
+      assert_equal 0, stdout.scan(/Failed to start worker/).count
+      assert_equal 1, stdout.scan(/Redis::BaseConnectionError: Redis::BaseConnectionError/).count
+
     ensure
       class Redis::Client
         alias_method :reconnect, :original_reconnect
@@ -906,6 +976,71 @@ context "Resque::Worker" do
             Resque.redis.del(*remaining_keys) unless remaining_keys.empty?
           end
         end
+      end
+    end
+
+    test "exits with Resque::TermException when using TERM_CHILD and not forking" do
+      begin
+        class LongRunningJob
+          @queue = :long_running_job
+
+          def self.perform(run_time)
+            Resque.redis.client.reconnect # get its own connection
+            Resque.redis.rpush('term-exception-test:start', Process.pid)
+            sleep run_time
+            Resque.redis.rpush('term-exception-test:result', 'Finished Normally')
+          rescue Resque::TermException => e
+            Resque.redis.rpush('term-exception-test:result', %Q(Caught TermException: #{e.inspect}))
+          ensure
+            Resque.redis.rpush('term-exception-test:final', 'exiting.')
+          end
+        end
+
+        Resque.enqueue(LongRunningJob, 5)
+
+        worker_pid = Kernel.fork do
+          # reconnect to redis
+          Resque.redis.client.reconnect
+
+          # ensure we don't fork (in worker)
+          $TESTING = false
+          ENV['FORK_PER_JOB'] = 'false'
+
+          worker = Resque::Worker.new(:long_running_job)
+          worker.term_timeout = 1
+          worker.term_child = 1
+
+          worker.work(0)
+          exit!
+        end
+
+        # ensure the worker is started
+        start_status = Resque.redis.blpop('term-exception-test:start', 5)
+        assert_not_nil start_status
+        child_pid = start_status[1].to_i
+        assert_operator child_pid, :>, 0
+
+        # send signal to abort the worker
+        Process.kill('TERM', worker_pid)
+        Process.waitpid(worker_pid)
+
+        # wait to see how it all came down
+        result = Resque.redis.blpop('term-exception-test:result', 5)
+        assert_not_nil result
+        assert !result[1].start_with?('Finished Normally'), 'Job finished normally. Sleep not long enough?'
+        assert result[1].start_with?('Caught TermException'), 'TermException not raised in child.'
+
+        # ensure that the child pid is no longer running
+        child_still_running = !(`ps -p #{child_pid.to_s} -o pid=`).empty?
+        assert !child_still_running
+
+        # see if post-cleanup occurred.
+        post_cleanup_occurred = Resque.redis.lpop( 'term-exception-test:final' )
+        assert post_cleanup_occurred, 'post cleanup did not occur. SIGKILL sent too early?'
+
+      ensure
+        remaining_keys = Resque.redis.keys('term-exception-test:*') || []
+        Resque.redis.del(*remaining_keys) unless remaining_keys.empty?
       end
     end
 
